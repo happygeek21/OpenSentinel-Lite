@@ -36,7 +36,7 @@ def register_user(username: str, password: str, email: str):
             (
                 username,
                 password_hash,
-                "user",
+                "employee",
                 email
             )
         )
@@ -69,7 +69,7 @@ def authenticate_user(username: str, password: str):
 
     cursor.execute(
         """
-        SELECT id, username, password_hash, role, email
+        SELECT id, username, password_hash, role, email, status
         FROM users
         WHERE username = ?
         """,
@@ -83,6 +83,9 @@ def authenticate_user(username: str, password: str):
     if user is None:
         return None
 
+    if user["status"] != "ACTIVE":
+        return None
+
     if not verify_password(
         password,
         user["password_hash"]
@@ -90,3 +93,28 @@ def authenticate_user(username: str, password: str):
         return None
 
     return dict(user)
+
+
+def ensure_default_admin():
+    conn = sqlite3.connect(DB)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE username = ?", ("admin",))
+    exists = cursor.fetchone()
+
+    if not exists:
+        cursor.execute(
+            """
+            INSERT INTO users (username, password_hash, role, email, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "admin",
+                get_password_hash("admin123"),
+                "admin",
+                "admin@opensentinel.local",
+                "ACTIVE",
+            ),
+        )
+
+    conn.commit()
+    conn.close()

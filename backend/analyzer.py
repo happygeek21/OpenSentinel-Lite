@@ -8,6 +8,10 @@ DB = "data/opensentinel.db"
 create_database()
 
 
+# --------------------------------------------------
+# SQL INJECTION PATTERNS
+# --------------------------------------------------
+
 SQLI_PATTERNS = [
     "' or ",
     '" or ',
@@ -21,10 +25,27 @@ SQLI_PATTERNS = [
     "delete from",
     "update ",
     "select ",
+    "--",
+    "/*",
+    "*/",
+]
+
+RECON_PATTERNS = [
+    "/admin",
+    "/.env",
+    "/backup",
+    "/config",
+    "../../etc/passwd",
+    "..\\..\\etc\\passwd",
 ]
 
 
 def detect_sql_injection(details):
+    """
+    Detect common SQL injection patterns
+    inside logged request details.
+    """
+
     if not details:
         return False
 
@@ -37,9 +58,34 @@ def detect_sql_injection(details):
     return False
 
 
-def alert_exists(alert_type, ip):
+def detect_reconnaissance(details, status):
+    value = (details or "").lower()
+    if any(pattern in value for pattern in RECON_PATTERNS):
+        return True
+    return str(status or "").upper() in {"404", "INVALID", "NOT_FOUND"}
+
+
+def classify_event(event):
+    details = event["details"] or ""
+    if detect_sql_injection(details):
+        return "HIGH", 90
+    if event["event_type"] == "LOGIN" and event["status"] == "FAILED":
+        return "MEDIUM", 50
+    if detect_reconnaissance(details, event["status"]):
+        return "MEDIUM", 60
+    return "NORMAL", 0
+
+
+# --------------------------------------------------
+# ALERT DATABASE FUNCTIONS
+# --------------------------------------------------
+
+def update_alert(alert):
     """
-    Prevent duplicate alerts for the same threat type and source IP.
+    Update an existing alert for the same
+    threat type and source IP.
+
+    Returns True if an existing alert was updated.
     """
 
     conn = sqlite3.connect(DB)
@@ -47,21 +93,43 @@ def alert_exists(alert_type, ip):
 
     cursor.execute(
         """
-        SELECT 1
-        FROM alerts
+        UPDATE alerts
+        SET attempts = ?,
+            risk_score = ?,
+            severity = ?,
+            detection_method = ?,
+            first_seen = COALESCE(?, first_seen),
+            last_seen = COALESCE(?, last_seen),
+            created_at = CURRENT_TIMESTAMP
         WHERE type = ?
         AND ip = ?
-        LIMIT 1
+        AND (username = ? OR (username IS NULL AND ? IS NULL))
         """,
-        (alert_type, ip)
+        (
+            alert["attempts"],
+            alert["risk"],
+            alert["severity"],
+            alert["detection_method"],
+            alert.get("first_seen"),
+            alert.get("last_seen"),
+            alert["type"],
+            alert["ip"],
+            alert.get("username"),
+            alert.get("username"),
+        )
     )
 
-    exists = cursor.fetchone() is not None
+    updated = cursor.rowcount
 
+    conn.commit()
     conn.close()
 
-    return exists
+    return updated > 0
 
+
+# --------------------------------------------------
+# MAIN ANALYZER
+# --------------------------------------------------
 
 def analyze_logs():
 
@@ -78,12 +146,28 @@ def analyze_logs():
     )
 
     events = cursor.fetchall()
+
     conn.close()
 
     failed_attempts = {}
+    sql_attempts = {}
+    recon_attempts = {}
+
     alerts = []
 
     total = len(events)
+
+    # Annotate raw events so the live monitor can show risk without inventing data.
+    update_conn = sqlite3.connect(DB)
+    update_cursor = update_conn.cursor()
+    for event in events:
+        severity, risk = classify_event(event)
+        update_cursor.execute(
+            "UPDATE events SET severity = ?, risk_score = ? WHERE id = ?",
+            (severity, risk, event["id"]),
+        )
+    update_conn.commit()
+    update_conn.close()
 
     # --------------------------------------------------
     # 1. BRUTE FORCE DETECTION
@@ -96,16 +180,14 @@ def analyze_logs():
             and event["status"] == "FAILED"
         ):
 
-            ip = event["source_ip"]
+            key = (event["source_ip"], event["username"])
+            failed_attempts[key] = failed_attempts.get(key, 0) + 1
 
-            if ip not in failed_attempts:
-                failed_attempts[ip] = 0
-
-            failed_attempts[ip] += 1
-
-    for ip, count in failed_attempts.items():
+    for (ip, username), count in failed_attempts.items():
 
         if count >= 5:
+
+            # Risk scoring for brute-force attacks
 
             if count >= 10:
                 risk = 95
@@ -122,22 +204,33 @@ def analyze_logs():
             alert = {
                 "type": "BRUTE_FORCE",
                 "ip": ip,
+                "username": username,
                 "attempts": count,
                 "risk": risk,
                 "severity": severity,
-                "detection_method": "Rule Engine"
+                "detection_method": "Rule Engine",
+                "first_seen": next(
+                    event["timestamp"] for event in events
+                    if event["source_ip"] == ip and event["username"] == username
+                    and event["event_type"] == "LOGIN" and event["status"] == "FAILED"
+                ),
+                "last_seen": next(
+                    event["timestamp"] for event in reversed(events)
+                    if event["source_ip"] == ip and event["username"] == username
+                    and event["event_type"] == "LOGIN" and event["status"] == "FAILED"
+                ),
             }
 
             alerts.append(alert)
 
-            if not alert_exists("BRUTE_FORCE", ip):
+            # Update existing alert or create a new one
+
+            if not update_alert(alert):
                 save_alert(alert)
 
     # --------------------------------------------------
     # 2. SQL INJECTION DETECTION
     # --------------------------------------------------
-
-    detected_sql_ips = set()
 
     for event in events:
 
@@ -145,30 +238,93 @@ def analyze_logs():
 
         if detect_sql_injection(details):
 
-            ip = event["source_ip"]
+            key = (event["source_ip"], event["username"])
+            sql_attempts[key] = sql_attempts.get(key, 0) + 1
 
-            # Avoid detecting the same source repeatedly
-            if ip in detected_sql_ips:
-                continue
-
-            detected_sql_ips.add(ip)
-
-            alert = {
-                "type": "SQL_INJECTION",
-                "ip": ip,
-                "attempts": 1,
-                "risk": 90,
-                "severity": "HIGH",
-                "detection_method": "SQL Injection Rule"
-            }
-
-            alerts.append(alert)
-
-            if not alert_exists("SQL_INJECTION", ip):
-                save_alert(alert)
+        if detect_reconnaissance(event["details"], event["status"]):
+            key = (event["source_ip"], event["username"])
+            recon_attempts[key] = recon_attempts.get(key, 0) + 1
 
     # --------------------------------------------------
-    # RESULT
+    # 3. SQL INJECTION RISK SCORING
+    # --------------------------------------------------
+
+    for (ip, username), count in sql_attempts.items():
+
+        # Risk increases with repeated attempts
+
+        if count >= 3:
+            risk = 90
+            severity = "HIGH"
+
+        elif count == 2:
+            risk = 80
+            severity = "HIGH"
+
+        else:
+            risk = 70
+            severity = "MEDIUM"
+
+        alert = {
+            "type": "SQL_INJECTION",
+            "ip": ip,
+            "username": username,
+            "attempts": count,
+            "risk": risk,
+            "severity": severity,
+            "detection_method": "SQL Injection Rule",
+            "first_seen": next(
+                event["timestamp"] for event in events
+                if event["source_ip"] == ip
+                and event["username"] == username
+                and detect_sql_injection(event["details"])
+            ),
+            "last_seen": next(
+                event["timestamp"] for event in reversed(events)
+                if event["source_ip"] == ip
+                and event["username"] == username
+                and detect_sql_injection(event["details"])
+            ),
+        }
+
+        alerts.append(alert)
+
+        # Update existing alert or create a new one
+
+        if not update_alert(alert):
+            save_alert(alert)
+
+    # Recon alerts use the same correlation model as SQL injection and brute force.
+    for (ip, username), count in recon_attempts.items():
+        risk = 75 if count >= 3 else 60
+        severity = "HIGH" if count >= 3 else "MEDIUM"
+        alert = {
+            "type": "RECONNAISSANCE",
+            "ip": ip,
+            "username": username,
+            "attempts": count,
+            "risk": risk,
+            "severity": severity,
+            "detection_method": "Suspicious Request Rule",
+            "first_seen": next(
+                event["timestamp"] for event in events
+                if event["source_ip"] == ip
+                and event["username"] == username
+                and detect_reconnaissance(event["details"], event["status"])
+            ),
+            "last_seen": next(
+                event["timestamp"] for event in reversed(events)
+                if event["source_ip"] == ip
+                and event["username"] == username
+                and detect_reconnaissance(event["details"], event["status"])
+            ),
+        }
+        alerts.append(alert)
+        if not update_alert(alert):
+            save_alert(alert)
+
+    # --------------------------------------------------
+    # 4. RETURN ANALYSIS RESULT
     # --------------------------------------------------
 
     if alerts:
@@ -176,15 +332,19 @@ def analyze_logs():
         return {
             "status": "ALERT",
             "total_logs": total,
-            "alerts": alerts
+            "alerts": alerts,
         }
 
     return {
         "status": "SAFE",
         "total_logs": total,
-        "alerts": []
+        "alerts": [],
     }
 
+
+# --------------------------------------------------
+# COMMAND LINE EXECUTION
+# --------------------------------------------------
 
 if __name__ == "__main__":
     print(analyze_logs())

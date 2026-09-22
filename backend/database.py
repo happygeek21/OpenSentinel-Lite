@@ -22,7 +22,8 @@ def create_database():
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL,
-            email TEXT UNIQUE
+            email TEXT UNIQUE,
+            status TEXT NOT NULL DEFAULT 'ACTIVE'
         )
         """
     )
@@ -37,7 +38,10 @@ def create_database():
             source_ip TEXT,
             username TEXT,
             event_type TEXT,
-            status TEXT
+            status TEXT,
+            details TEXT DEFAULT '',
+            severity TEXT DEFAULT 'NORMAL',
+            risk_score INTEGER DEFAULT 0
         )
         """
     )
@@ -50,11 +54,14 @@ def create_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             type TEXT,
             ip TEXT,
+            username TEXT,
             attempts INTEGER,
             risk_score INTEGER,
             severity TEXT,
             detection_method TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            first_seen TEXT,
+            last_seen TEXT
         )
         """
     )
@@ -92,6 +99,22 @@ def create_database():
         """
     )
 
+    # Security notifications for the analyst dashboard
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notifications
+        (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id INTEGER,
+            title TEXT,
+            message TEXT,
+            is_read INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (alert_id) REFERENCES alerts(id)
+        )
+        """
+    )
+
     # Future ML model information
     cursor.execute(
         """
@@ -106,6 +129,36 @@ def create_database():
         """
     )
 
+    conn.commit()
+
+    # Keep existing databases usable when new monitoring fields are added.
+    migrations = {
+        "users": {
+            "status": "TEXT NOT NULL DEFAULT 'ACTIVE'",
+        },
+        "events": {
+            "severity": "TEXT DEFAULT 'NORMAL'",
+            "risk_score": "INTEGER DEFAULT 0",
+        },
+        "alerts": {
+            "username": "TEXT",
+            "first_seen": "TEXT",
+            "last_seen": "TEXT",
+        },
+    }
+
+    for table, columns in migrations.items():
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for column, definition in columns.items():
+            if column not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                )
+
+    cursor.execute(
+        "UPDATE users SET status = 'ACTIVE' WHERE status IS NULL"
+    )
     conn.commit()
     conn.close()
 
@@ -123,23 +176,64 @@ def save_alert(alert):
         (
             type,
             ip,
+            username,
             attempts,
             risk_score,
             severity,
             detection_method,
-            created_at
+            created_at,
+            first_seen,
+            last_seen
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             alert["type"],
             alert["ip"],
+            alert.get("username"),
             alert["attempts"],
             alert.get("risk", 0),
             alert["severity"],
             alert.get("detection_method", "Rule Engine"),
-            datetime.now().isoformat()
+            datetime.now().isoformat(),
+            alert.get("first_seen"),
+            alert.get("last_seen")
         )
+    )
+
+    alert_id = cursor.lastrowid
+    title = f"{alert['type']} Detected"
+    message = (
+        f"{alert['type']} detected from {alert['ip']} with "
+        f"{alert['attempts']} attempts. Risk score: {alert.get('risk', 0)}"
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO notifications
+        (alert_id, title, message, is_read, created_at)
+        VALUES (?, ?, ?, 0, ?)
+        """,
+        (alert_id, title, message, datetime.now().isoformat())
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def save_notification(alert_id, title, message):
+    from datetime import datetime
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO notifications
+        (alert_id, title, message, is_read, created_at)
+        VALUES (?, ?, ?, 0, ?)
+        """,
+        (alert_id, title, message, datetime.now().isoformat())
     )
 
     conn.commit()

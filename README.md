@@ -37,9 +37,19 @@ Install dependencies:
 
 pip install -r requirements.txt
 
-Run log generator:
+Run the refined demo log generator from the project root. It overwrites
+`data/security.log` by default, writes the same events to SQLite, and emits a
+normal search, SQL injection, reconnaissance, and brute-force sequence:
 
-python backend/log_generator.py
+python -m backend.log_generator --interval 2
+
+Generate the sequence immediately:
+
+python -m backend.log_generator --interval 0
+
+Keep existing file contents instead of overwriting:
+
+python -m backend.log_generator --append
 
 Run scanner:
 
